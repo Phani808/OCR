@@ -444,7 +444,7 @@ def process_url_list_for_record(url_list: list[str], document_type: str, record:
     page_no_missing = False
     failed_url = None
     
-    # Step 1: OCR each page and check page_no immediately - STOP if missing
+    # Step 1: OCR each page and check page_no AND survey_numbers immediately - STOP if either is missing
     for url in url_list:
         logger.info(f"Trans_Id={trans_id}: Processing page {len(results) + 1}/{len(url_list)}: {url}")
         
@@ -459,7 +459,15 @@ def process_url_list_for_record(url_list: list[str], document_type: str, record:
                 failed_url = url
                 break  # Stop processing this PDF immediately
             
-            logger.info(f"Trans_Id={trans_id}: Page {page_no} found for {url}")
+            # Also check if survey_numbers exist
+            survey_numbers = result.get('survey_numbers', [])
+            if not survey_numbers or len(survey_numbers) == 0:
+                logger.error(f"Trans_Id={trans_id}: Survey numbers NOT FOUND for {url} - STOPPING processing")
+                page_no_missing = True
+                failed_url = url
+                break  # Stop processing this PDF immediately
+            
+            logger.info(f"Trans_Id={trans_id}: Page {page_no} with {len(survey_numbers)} survey numbers found for {url}")
             results.append(result)
             
         except Exception as e:
@@ -468,10 +476,10 @@ def process_url_list_for_record(url_list: list[str], document_type: str, record:
             failed_url = url
             break  # Stop processing on any error
     
-    # Step 2: If any page is missing page_no, mark as "Page No Not Found" and exit
+    # Step 2: If any page is missing page_no or survey_numbers, mark as failed and exit
     if page_no_missing:
-        logger.warning(f"Trans_Id={trans_id}: Marking as 'Page No Not Found' due to missing page number at {failed_url}")
-        update_book_status(trans_id, "Page No Not Found", 3)
+        logger.warning(f"Trans_Id={trans_id}: Marking as 'Page No Or Survey No Not Found' due to missing data at {failed_url}")
+        update_book_status(trans_id, "Page No Or Survey No Not Found", 3)
         return False, results
     
     # Step 3: All pages have page numbers - insert into database
