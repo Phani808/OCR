@@ -1,0 +1,5 @@
+requests
+Pillow
+PyMuPDF
+python-dotenv
+google-genai
