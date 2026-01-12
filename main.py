@@ -49,7 +49,7 @@ def fetch_book_upload_data():
                 [Bhargo_Is_Active], [Bhargo_GPS], [Bhargo_IME], [Bhargo_DId],
                 [Bhargo_Employee_Location], [TransactionDate], [TransactionMonth], [TransactionYear],
                 [book_status], [book_statusid]
-            FROM [CCLA].[dbo].[Book_Upload_Copy]
+            FROM [CCLA].[dbo].[Book_Upload]
             WHERE [book_status] = 'Pending'
         """)
         return cursor.fetchall()
@@ -81,7 +81,7 @@ def update_book_status(trans_id: int, status: str, status_id: int):
         cursor = conn.cursor()
         
         sql = """
-            UPDATE [CCLA].[dbo].[Book_Upload_Copy]
+            UPDATE [CCLA].[dbo].[Book_Upload]
             SET [book_status] = %s, [book_statusid] = %s
             WHERE [Bhargo_Trans_Id] = %s
         """
@@ -124,7 +124,7 @@ def insert_page_record(record: dict, ocr_result: dict):
         
         # Extract metadata from original record
         sql = """
-            INSERT INTO [CCLA].[dbo].[Page_Upload_Copy] (
+            INSERT INTO [CCLA].[dbo].[Page_Upload] (
                 [Bhargo_Emp_Id], [Bhargo_PostID], [Bhargo_Trans_Date],
                 [district], [district_id],
                 [mandal], [mandal_id],
@@ -221,7 +221,7 @@ def insert_survey_numbers(record: dict, new_page_trans_id: int, survey_numbers: 
         cursor = conn.cursor()
         
         sql = """
-            INSERT INTO [CCLA].[dbo].[Page_Upload_document_data_Copy] (
+            INSERT INTO [CCLA].[dbo].[Page_Upload_document_data] (
                 [Bhargo_Emp_Id], [Bhargo_PostID], [Bhargo_Trans_Date],
                 [Bhargo_Ref_TransID], [document_data_survery_no],
                 [Bhargo_Is_Active], [Bhargo_GPS], [Bhargo_IME], [Bhargo_DId],
