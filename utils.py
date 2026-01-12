@@ -15,8 +15,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # ---------------- CONFIG ------------------
 OUTPUT_DIR = "gemini_ocr_output3"
-# MODEL_NAME = "gemini-3-flash-preview"
-MODEL_NAME = "gemini-2.5-pro"
+MODEL_NAME = "gemini-3-flash-preview"
+# MODEL_NAME = "gemini-2.5-pro"
+# MODEL_NAME = "gemini-3-pro-preview"
+# MODEL_NAME = "gemini-3-pro-image-preview"
 
 
 # ---------------- LOGGING CONFIG ----------
@@ -88,9 +90,8 @@ Objective:
 Identify and extract ONLY the Survey Numbers from the document.
 
 Important:
-• The document type is UNKNOWN.
-• The column header "Survey No" may NOT be present.
-• You must identify the survey number column by analyzing the WRITTEN DATA ONLY.
+• Survey number usually present in column 2
+
 
 How to identify page number:
 - Page number usually appears at the top of the page.
@@ -107,12 +108,14 @@ Survey Numbers usually:
 - Do NOT contain decimals like 1.25 or 0.75.
 - Do NOT contain currency symbols.
 - Do NOT look like names or sentences.
+- Survey number column is the second column from left side of the document.
+- If column headers (e.g., "Survey No", "S.No", "సర్వే నంబరు") are present, use that column; otherwise, identify the column based on the data format.
+
 
 Handling special cases:
 - identify the number of rows in the document. each row has only one survey number only.
 - Identify the survey number column as the column where ALL rows follow the SAME FORMAT pattern (e.g., number, number/number, number-letter, number-number).
 - Ignore numeric values that follow different formats in different rows.
-- If ditto marks ***(", do, blank,empty)*** are used, repeat the previous survey number.
 - Ignore totals, remarks, and assessment rows.
 
 Output Rules:
@@ -187,7 +190,7 @@ def gemini_ocr(image, page_no, prompt_type="unknown"):
                 'safety_settings': safety_settings
             }
         )
-        logger.debug(f"Gemini response for page {page_no}: {response.text}")
+        logger.info(f"Gemini response for page {page_no}: {response.text}")
         return response.text or ""
     except Exception as e:
         logger.error(f"Error during Gemini OCR for page {page_no}: {str(e)}")
