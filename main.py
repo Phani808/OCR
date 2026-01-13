@@ -7,7 +7,7 @@ import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
-from utils import process_single_image_url
+from utils import process_single_image_url, process_ocr_concurrent
 
 # ---------------- LOGGING CONFIG ----------
 logging.basicConfig(
@@ -27,6 +27,15 @@ MAX_WORKERS = 10  # Number of parallel downloads
 UPLOAD_API_URL = "http://182.18.157.124/CCLAAPI/V1/UploadImageVideoFiles/ASPXUpload"
 USER_ID = "12345"  # Default UserID for upload
 
+# Database table configuration
+DB_NAME = os.getenv('DB_NAME', 'CCLA')  # Database name
+DB_SCHEMA = os.getenv('DB_SCHEMA', 'dbo')  # Schema name
+
+# Table names (using f-strings with DB_NAME and DB_SCHEMA)
+TABLE_BOOK_UPLOAD = f"[{DB_NAME}].[{DB_SCHEMA}].[Book_Upload_Copy]"
+TABLE_PAGE_UPLOAD = f"[{DB_NAME}].[{DB_SCHEMA}].[Page_Upload_Copy]"
+TABLE_PAGE_UPLOAD_DOC_DATA = f"[{DB_NAME}].[{DB_SCHEMA}].[Page_Upload_document_data_Copy]"
+
 
 # Fetch book upload data from database
 def fetch_book_upload_data():
@@ -39,7 +48,7 @@ def fetch_book_upload_data():
         )
         cursor = conn.cursor(as_dict=True)
         logger.info("Connected to database")
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT
                 [Bhargo_Emp_Id], [Bhargo_PostID], [Bhargo_Trans_Id],
                 [district], [district_id],
@@ -49,7 +58,7 @@ def fetch_book_upload_data():
                 [Bhargo_Is_Active], [Bhargo_GPS], [Bhargo_IME], [Bhargo_DId],
                 [Bhargo_Employee_Location], [TransactionDate], [TransactionMonth], [TransactionYear],
                 [book_status], [book_statusid]
-            FROM [CCLA].[dbo].[Book_Upload]
+            FROM {TABLE_BOOK_UPLOAD}
             WHERE [book_status] = 'Pending'
         """)
         return cursor.fetchall()
@@ -80,8 +89,8 @@ def update_book_status(trans_id: int, status: str, status_id: int):
         )
         cursor = conn.cursor()
         
-        sql = """
-            UPDATE [CCLA].[dbo].[Book_Upload]
+        sql = f"""
+            UPDATE {TABLE_BOOK_UPLOAD}
             SET [book_status] = %s, [book_statusid] = %s
             WHERE [Bhargo_Trans_Id] = %s
         """
@@ -123,8 +132,8 @@ def insert_page_record(record: dict, ocr_result: dict):
         image_url = ocr_result.get('image_url')
         
         # Extract metadata from original record
-        sql = """
-            INSERT INTO [CCLA].[dbo].[Page_Upload] (
+        sql = f"""
+            INSERT INTO {TABLE_PAGE_UPLOAD} (
                 [Bhargo_Emp_Id], [Bhargo_PostID], [Bhargo_Trans_Date],
                 [district], [district_id],
                 [mandal], [mandal_id],
@@ -220,8 +229,8 @@ def insert_survey_numbers(record: dict, new_page_trans_id: int, survey_numbers: 
         )
         cursor = conn.cursor()
         
-        sql = """
-            INSERT INTO [CCLA].[dbo].[Page_Upload_document_data] (
+        sql = f"""
+            INSERT INTO {TABLE_PAGE_UPLOAD_DOC_DATA} (
                 [Bhargo_Emp_Id], [Bhargo_PostID], [Bhargo_Trans_Date],
                 [Bhargo_Ref_TransID], [document_data_survery_no],
                 [Bhargo_Is_Active], [Bhargo_GPS], [Bhargo_IME], [Bhargo_DId],
@@ -511,6 +520,107 @@ def process_url_list_for_record(url_list: list[str], document_type: str, record:
     return insert_success, results
 
 
+async def async_process_url_list_for_record(url_list: list[str], document_type: str, record: dict):
+    """
+    Process URLs concurrently (5 at a time) for a single record with immediate DB insertion.
+    
+    This function:
+    1. Runs up to 5 OCR operations in parallel
+    2. As soon as each OCR completes, immediately inserts the result into the database
+    3. If any result is missing page_no or survey_numbers, stops all further processing
+    4. Updates final book status based on overall success
+    
+    Args:
+        url_list: List of image URLs to process
+        document_type: Type of document for OCR prompt
+        record: Original record from Book_Upload with metadata
+    
+    Returns:
+        tuple: (success: bool, results: list)
+        - success: True if all pages processed and inserted successfully
+        - results: List of OCR results (may be partial if stopped early)
+    """
+    trans_id = record.get('Bhargo_Trans_Id')
+    logger.info(f"[Async] Processing {len(url_list)} URLs for Trans_Id={trans_id} | Document Type: {document_type} | Max Concurrent: 5")
+    
+    inserted_results = []
+    failed = False
+    failed_url = None
+    
+    def on_ocr_result(result: dict) -> bool:
+        """
+        Callback called immediately when each OCR completes.
+        Validates the result and inserts into database right away.
+        
+        Returns:
+            bool: True to continue processing other URLs, False to stop processing
+        """
+        nonlocal failed, failed_url
+        
+        image_url = result.get('image_url')
+        
+        # Check for errors
+        if 'error' in result:
+            logger.error(f"Trans_Id={trans_id}: OCR error for {image_url}: {result.get('error')}")
+            failed = True
+            failed_url = image_url
+            return False  # Stop processing
+        
+        # Validate page_no
+        page_no = result.get('page_no')
+        if page_no is None or str(page_no).strip() == '':
+            logger.error(f"Trans_Id={trans_id}: Page number NOT FOUND for {image_url}")
+            failed = True
+            failed_url = image_url
+            return False  # Stop processing
+        
+        # Validate survey_numbers
+        survey_numbers = result.get('survey_numbers', [])
+        if not survey_numbers or len(survey_numbers) == 0:
+            logger.error(f"Trans_Id={trans_id}: Survey numbers NOT FOUND for {image_url}")
+            failed = True
+            failed_url = image_url
+            return False  # Stop processing
+        
+        # All validations passed - INSERT IMMEDIATELY into database
+        logger.info(f"Trans_Id={trans_id}: Inserting page {page_no} with {len(survey_numbers)} survey numbers immediately")
+        
+        new_trans_id = insert_page_record(record, result)
+        
+        if new_trans_id:
+            logger.info(f"Trans_Id={trans_id}: Inserted page_no={page_no}, url={image_url}, new_trans_id={new_trans_id}")
+            
+            # Insert survey numbers linked to the new page record
+            insert_survey_numbers(record, new_trans_id, survey_numbers)
+            inserted_results.append(result)
+            return True  # Continue processing
+        else:
+            logger.error(f"Trans_Id={trans_id}: Failed to insert page record for {image_url}")
+            failed = True
+            failed_url = image_url
+            return False  # Stop processing
+    
+    # Run concurrent OCR with immediate callback
+    all_success, results = await process_ocr_concurrent(
+        url_list=url_list,
+        document_type=document_type,
+        on_result_callback=on_ocr_result,
+        max_concurrent=5
+    )
+    
+    # Update final book status
+    if failed:
+        logger.warning(f"Trans_Id={trans_id}: Marking as 'Page No Or Survey No Not Found' due to error at {failed_url}")
+        update_book_status(trans_id, "Page No Or Survey No Not Found", 3)
+        return False, inserted_results
+    
+    if all_success and len(inserted_results) == len(url_list):
+        update_book_status(trans_id, "Completed", 2)
+        logger.info(f"Trans_Id={trans_id}: Processing completed successfully! All {len(inserted_results)} pages inserted.")
+        return True, inserted_results
+    else:
+        logger.error(f"Trans_Id={trans_id}: Some operations failed. Inserted: {len(inserted_results)}/{len(url_list)}")
+        return False, inserted_results
 
 
 if __name__ == "__main__":
@@ -538,8 +648,10 @@ if __name__ == "__main__":
             if url_list:
                 logger.info(f"Trans_Id={trans_id}: Extracted {len(url_list)} page images")
                 
-                # Process OCR and validate/insert
-                success, ocr_results = process_url_list_for_record(url_list, document_type, record)
+                # Process OCR with concurrent processing (5 at a time) and immediate DB insertion
+                success, ocr_results = asyncio.run(
+                    async_process_url_list_for_record(url_list, document_type, record)
+                )
                 
                 if success:
                     logger.info(f"Trans_Id={trans_id}: Successfully processed and marked as Completed")

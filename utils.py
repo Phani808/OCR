@@ -7,6 +7,9 @@ import io
 from dotenv import load_dotenv
 from google import genai
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Any
 
 # ---------------- LOAD ENV ----------------
 load_dotenv()
@@ -197,19 +200,204 @@ def gemini_ocr(image, page_no, prompt_type="unknown"):
         return ""
 
 
-def process_single_image_url(image_url,type="unknown"):
+# Thread pool for running sync OCR in async context
+_ocr_executor = ThreadPoolExecutor(max_workers=10)
+
+# Semaphore to limit concurrent OCR operations to 5
+OCR_CONCURRENCY_LIMIT = 5
+
+# Retry configuration
+OCR_MAX_RETRIES = 3
+
+
+async def async_process_single_image_url(image_url: str, document_type: str = "unknown") -> dict:
+    """
+    Async wrapper for process_single_image_url.
+    Downloads image and performs OCR in a thread pool to avoid blocking.
+    Retries up to 3 times if page_no or survey_numbers are missing.
+    
+    Args:
+        image_url: URL of the image to process
+        document_type: Type of document for OCR prompt
+    
+    Returns:
+        dict: OCR result with image_url, page_no, survey_numbers, or error
+    """
+    loop = asyncio.get_event_loop()
+    
+    def _sync_ocr_with_retry():
+        """Synchronous OCR processing with retry logic."""
+        logger.info(f"[Async OCR] Processing image URL: {image_url}")
+        
+        # Download image once (reuse for retries)
+        try:
+            response = requests.get(image_url, timeout=60)
+            response.raise_for_status()
+            image_bytes = response.content
+        except Exception as e:
+            logger.error(f"[Async OCR] Failed to download image {image_url}: {e}")
+            return {"image_url": image_url, "error": str(e)}
+        
+        last_result = None
+        
+        for attempt in range(1, OCR_MAX_RETRIES + 1):
+            try:
+                image = Image.open(io.BytesIO(image_bytes))
+                
+                # Perform OCR
+                ocr_result_text = gemini_ocr(image, 1, prompt_type=document_type)
+                
+                # Try to parse JSON
+                try:
+                    cleaned_text = ocr_result_text.replace("```json", "").replace("```", "").strip()
+                    data = json.loads(cleaned_text)
+                except json.JSONDecodeError:
+                    logger.warning(f"[Async OCR] Attempt {attempt}/{OCR_MAX_RETRIES}: Failed to parse JSON from Gemini response: {ocr_result_text}")
+                    data = {}  # Empty dict - keys are missing
+
+                result = {
+                    "image_url": image_url,
+                    "page_no": data.get("page_no"),
+                    "survey_numbers": data.get("survey_numbers", [])
+                }
+                last_result = result
+                
+                # Check if keys exist in the response (values can be empty)
+                has_page_no_key = "page_no" in data
+                has_survey_numbers_key = "survey_numbers" in data
+                
+                if has_page_no_key and has_survey_numbers_key:
+                    logger.info(f"[Async OCR] Success on attempt {attempt}/{OCR_MAX_RETRIES}: page_no={data.get('page_no')}, survey_numbers={data.get('survey_numbers')}")
+                    return result
+                else:
+                    missing = []
+                    if not has_page_no_key:
+                        missing.append("page_no")
+                    if not has_survey_numbers_key:
+                        missing.append("survey_numbers")
+                    
+                    if attempt < OCR_MAX_RETRIES:
+                        logger.warning(f"[Async OCR] Attempt {attempt}/{OCR_MAX_RETRIES}: Missing {missing} for {image_url}. Retrying...")
+                    else:
+                        logger.error(f"[Async OCR] Attempt {attempt}/{OCR_MAX_RETRIES}: Missing {missing} for {image_url}. No more retries.")
+
+            except Exception as e:
+                logger.error(f"[Async OCR] Attempt {attempt}/{OCR_MAX_RETRIES}: Error processing {image_url}: {e}")
+                last_result = {"image_url": image_url, "error": str(e)}
+                
+                if attempt >= OCR_MAX_RETRIES:
+                    return last_result
+        
+        # Return the last result after all retries exhausted
+        return last_result or {"image_url": image_url, "error": "All retries exhausted"}
+    
+    # Run the sync OCR in thread pool to not block event loop
+    return await loop.run_in_executor(_ocr_executor, _sync_ocr_with_retry)
+
+
+async def process_ocr_concurrent(
+    url_list: list[str],
+    document_type: str,
+    on_result_callback: Callable[[dict], Any],
+    max_concurrent: int = OCR_CONCURRENCY_LIMIT
+) -> tuple[bool, list[dict]]:
+    """
+    Process OCR for multiple URLs concurrently with immediate callback on each result.
+    
+    This function runs up to `max_concurrent` OCR operations in parallel.
+    As soon as each OCR completes, the `on_result_callback` is called with the result,
+    allowing immediate database insertion without waiting for all OCRs to complete.
+    
+    Args:
+        url_list: List of image URLs to process
+        document_type: Type of document for OCR prompt selection
+        on_result_callback: Callback function called immediately when each OCR completes.
+                           Signature: callback(ocr_result: dict) -> bool
+                           Should return True to continue processing, False to stop (e.g., on error)
+        max_concurrent: Maximum number of concurrent OCR operations (default: 5)
+    
+    Returns:
+        tuple: (all_success: bool, results: list[dict])
+        - all_success: True if all OCRs completed successfully and callbacks returned True
+        - results: List of all OCR results (may be partial if stopped early)
+    """
+    logger.info(f"[Concurrent OCR] Starting OCR for {len(url_list)} URLs | Max Concurrent: {max_concurrent}")
+    
+    semaphore = asyncio.Semaphore(max_concurrent)
+    results = []
+    all_success = True
+    stop_processing = False
+    results_lock = asyncio.Lock()
+    
+    async def process_with_callback(url: str, index: int):
+        nonlocal all_success, stop_processing
+        
+        # Check if we should stop (another task failed)
+        if stop_processing:
+            return None
+        
+        async with semaphore:
+            # Double-check stop flag after acquiring semaphore
+            if stop_processing:
+                return None
+            
+            logger.info(f"[Concurrent OCR] Processing URL {index + 1}/{len(url_list)}: {url}")
+            
+            try:
+                # Perform async OCR
+                result = await async_process_single_image_url(url, document_type)
+                
+                # Immediately call the callback with the result
+                async with results_lock:
+                    if not stop_processing:
+                        results.append(result)
+                        
+                        # Call callback - if it returns False, stop processing
+                        should_continue = on_result_callback(result)
+                        
+                        if not should_continue:
+                            logger.warning(f"[Concurrent OCR] Callback returned False for {url} - stopping further processing")
+                            all_success = False
+                            stop_processing = True
+                        else:
+                            logger.info(f"[Concurrent OCR] Result processed for {url}: page_no={result.get('page_no')}")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"[Concurrent OCR] Error processing {url}: {e}")
+                error_result = {"image_url": url, "error": str(e)}
+                
+                async with results_lock:
+                    results.append(error_result)
+                    all_success = False
+                    stop_processing = True
+                
+                return error_result
+    
+    # Create tasks for all URLs
+    tasks = [process_with_callback(url, i) for i, url in enumerate(url_list)]
+    
+    # Run all tasks concurrently (semaphore limits actual parallelism to max_concurrent)
+    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    logger.info(f"[Concurrent OCR] Completed. Processed: {len(results)}/{len(url_list)}, Success: {all_success}")
+    return all_success, results
+
+
+def process_single_image_url(image_url, document_type="unknown"):
     """
     Downloads an image from a URL, performs OCR, and returns the results.
     """
     logger.info(f"Processing image URL: {image_url}")
     try:
-        response = requests.get(image_url)
+        response = requests.get(image_url, timeout=60)
         response.raise_for_status()
         
         image = Image.open(io.BytesIO(response.content))
         
         # We pass page_no=1 as a placeholder since it's a single image
-        ocr_result_text = gemini_ocr(image, 1, prompt_type="unknown")
+        ocr_result_text = gemini_ocr(image, 1, prompt_type=document_type)
         
         # Try to parse JSON
         try:
