@@ -522,13 +522,14 @@ def process_url_list_for_record(url_list: list[str], document_type: str, record:
 
 async def async_process_url_list_for_record(url_list: list[str], document_type: str, record: dict):
     """
-    Process URLs concurrently (5 at a time) for a single record with immediate DB insertion.
+    Process URLs concurrently (5 at a time) for a single record.
     
     This function:
     1. Runs up to 5 OCR operations in parallel
-    2. As soon as each OCR completes, immediately inserts the result into the database
-    3. If any result is missing page_no or survey_numbers, stops all further processing
-    4. Updates final book status based on overall success
+    2. COLLECTS ALL results first without inserting
+    3. After ALL results are collected, validates each page has page_no AND survey_numbers
+    4. ONLY if ALL pages are valid, inserts into database
+    5. If ANY page is invalid, marks entire document as failed (no inserts)
     
     Args:
         url_list: List of image URLs to process
@@ -538,53 +539,114 @@ async def async_process_url_list_for_record(url_list: list[str], document_type: 
     Returns:
         tuple: (success: bool, results: list)
         - success: True if all pages processed and inserted successfully
-        - results: List of OCR results (may be partial if stopped early)
+        - results: List of OCR results
     """
     trans_id = record.get('Bhargo_Trans_Id')
     logger.info(f"[Async] Processing {len(url_list)} URLs for Trans_Id={trans_id} | Document Type: {document_type} | Max Concurrent: 5")
     
-    inserted_results = []
-    failed = False
-    failed_url = None
+    collected_results = []
     
     def on_ocr_result(result: dict) -> bool:
         """
         Callback called immediately when each OCR completes.
-        Validates the result and inserts into database right away.
+        Just collects results - does NOT insert into database yet.
         
         Returns:
-            bool: True to continue processing other URLs, False to stop processing
+            bool: Always True to continue processing all URLs
         """
-        nonlocal failed, failed_url
+        image_url = result.get('image_url')
         
+        # Check for errors - log but continue collecting other results
+        if 'error' in result:
+            logger.error(f"Trans_Id={trans_id}: OCR error for {image_url}: {result.get('error')}")
+        
+        # Collect the result regardless of validity - we'll validate all at the end
+        collected_results.append(result)
+        logger.info(f"Trans_Id={trans_id}: Collected OCR result for {image_url} ({len(collected_results)}/{len(url_list)})")
+        
+        return True  # Always continue to collect all results
+    
+    # Run concurrent OCR - collect all results first
+    all_success, results = await process_ocr_concurrent(
+        url_list=url_list,
+        document_type=document_type,
+        on_result_callback=on_ocr_result,
+        max_concurrent=5
+    )
+    
+    logger.info(f"Trans_Id={trans_id}: All OCR completed. Collected {len(collected_results)} results. Now validating...")
+    
+    # Step 2: Validate ALL results - check if any page is missing page_no or survey_numbers
+    invalid_pages = []
+    valid_results = []
+    page_no_missing = False
+    survey_no_missing = False
+    
+    for result in collected_results:
         image_url = result.get('image_url')
         
         # Check for errors
         if 'error' in result:
-            logger.error(f"Trans_Id={trans_id}: OCR error for {image_url}: {result.get('error')}")
-            failed = True
-            failed_url = image_url
-            return False  # Stop processing
+            invalid_pages.append({
+                'url': image_url,
+                'reason': f"OCR error: {result.get('error')}"
+            })
+            continue
         
         # Validate page_no
         page_no = result.get('page_no')
         if page_no is None or str(page_no).strip() == '':
-            logger.error(f"Trans_Id={trans_id}: Page number NOT FOUND for {image_url}")
-            failed = True
-            failed_url = image_url
-            return False  # Stop processing
+            invalid_pages.append({
+                'url': image_url,
+                'reason': 'Page number NOT FOUND'
+            })
+            page_no_missing = True
+            continue
         
         # Validate survey_numbers
         survey_numbers = result.get('survey_numbers', [])
         if not survey_numbers or len(survey_numbers) == 0:
-            logger.error(f"Trans_Id={trans_id}: Survey numbers NOT FOUND for {image_url}")
-            failed = True
-            failed_url = image_url
-            return False  # Stop processing
+            invalid_pages.append({
+                'url': image_url,
+                'reason': 'Survey numbers NOT FOUND'
+            })
+            survey_no_missing = True
+            continue
         
-        # All validations passed - INSERT IMMEDIATELY into database
-        logger.info(f"Trans_Id={trans_id}: Inserting page {page_no} with {len(survey_numbers)} survey numbers immediately")
+        # This result is valid
+        valid_results.append(result)
+    
+    # Step 3: If ANY page is invalid, mark entire document as failed (NO inserts)
+    if invalid_pages:
+        logger.warning(f"Trans_Id={trans_id}: {len(invalid_pages)} pages have invalid data. NOT inserting any records.")
+        for invalid in invalid_pages:
+            logger.warning(f"  - {invalid['url']}: {invalid['reason']}")
         
+        # Determine the appropriate status message based on what's missing
+        if page_no_missing and survey_no_missing:
+            status_message = "Page No Or Survey No Not Found"
+        elif page_no_missing:
+            status_message = "Page No Not Found"
+        elif survey_no_missing:
+            status_message = "Survey No Not Found"
+        else:
+            status_message = "OCR Error"  # For general OCR errors
+        
+        update_book_status(trans_id, status_message, 3)
+        return False, collected_results
+    
+    # Step 4: ALL pages are valid - now insert all records into database
+    logger.info(f"Trans_Id={trans_id}: All {len(valid_results)} pages are valid. Inserting into database...")
+    
+    inserted_results = []
+    insert_failed = False
+    
+    for result in valid_results:
+        page_no = result.get('page_no')
+        image_url = result.get('image_url')
+        survey_numbers = result.get('survey_numbers', [])
+        
+        # Insert page record
         new_trans_id = insert_page_record(record, result)
         
         if new_trans_id:
@@ -593,34 +655,18 @@ async def async_process_url_list_for_record(url_list: list[str], document_type: 
             # Insert survey numbers linked to the new page record
             insert_survey_numbers(record, new_trans_id, survey_numbers)
             inserted_results.append(result)
-            return True  # Continue processing
         else:
             logger.error(f"Trans_Id={trans_id}: Failed to insert page record for {image_url}")
-            failed = True
-            failed_url = image_url
-            return False  # Stop processing
+            insert_failed = True
     
-    # Run concurrent OCR with immediate callback
-    all_success, results = await process_ocr_concurrent(
-        url_list=url_list,
-        document_type=document_type,
-        on_result_callback=on_ocr_result,
-        max_concurrent=5
-    )
-    
-    # Update final book status
-    if failed:
-        logger.warning(f"Trans_Id={trans_id}: Marking as 'Page No Or Survey No Not Found' due to error at {failed_url}")
-        update_book_status(trans_id, "Page No Or Survey No Not Found", 3)
+    # Step 5: Update final book status
+    if insert_failed:
+        logger.error(f"Trans_Id={trans_id}: Some database inserts failed. Inserted: {len(inserted_results)}/{len(valid_results)}")
         return False, inserted_results
     
-    if all_success and len(inserted_results) == len(url_list):
-        update_book_status(trans_id, "Completed", 2)
-        logger.info(f"Trans_Id={trans_id}: Processing completed successfully! All {len(inserted_results)} pages inserted.")
-        return True, inserted_results
-    else:
-        logger.error(f"Trans_Id={trans_id}: Some operations failed. Inserted: {len(inserted_results)}/{len(url_list)}")
-        return False, inserted_results
+    update_book_status(trans_id, "Completed", 2)
+    logger.info(f"Trans_Id={trans_id}: Processing completed successfully! All {len(inserted_results)} pages inserted.")
+    return True, inserted_results
 
 
 if __name__ == "__main__":
